@@ -219,7 +219,7 @@ Return ONLY a valid JSON object. No other text, no markdown.
     
     for attempt in range(2):  # Try twice, because APIs are moody
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("gemini-2.5-flash-lite")
             response = model.generate_content(prompt)
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(cleaned_response)
