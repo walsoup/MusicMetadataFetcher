@@ -22,7 +22,7 @@ A Python tool to **automatically fix, enrich, and manage MP3 metadata** with hel
 
 ### Requirements
 
-* **Python 3.11+** (needed for `typing.Self`)
+* **Python 3.11+** (needed for `typing.Self`, can be installed by `pip install python3.11`)
 * Dependencies:
 
   ```bash
