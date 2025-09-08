@@ -2,8 +2,6 @@ import os
 import argparse
 import json
 import time
-import tkinter as tk
-from tkinter import filedialog
 from pathlib import Path
 import requests
 from io import BytesIO
@@ -36,6 +34,29 @@ console = Console()
 # --- SPOTIFY CACHE (Because why waste API calls) ---
 SPOTIFY_CACHE_FILE = 'spotify_cache.json'
 spotify_cache = {}
+spotify_artist_genre_cache = {}
+SPOTIFY_ARTIST_GENRE_CACHE_FILE = 'spotify_artist_genres.json'
+lastfm_track_genre_cache = {}
+LASTFM_TRACK_GENRE_CACHE_FILE = 'lastfm_track_genres.json'
+
+def load_artist_genre_cache():
+    """Load persistent artist->genres cache from disk."""
+    global spotify_artist_genre_cache
+    try:
+        if os.path.exists(SPOTIFY_ARTIST_GENRE_CACHE_FILE):
+            with open(SPOTIFY_ARTIST_GENRE_CACHE_FILE, 'r') as f:
+                spotify_artist_genre_cache = json.load(f)
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Failed to load artist genre cache: {e}. Starting fresh.[/yellow]")
+        spotify_artist_genre_cache = {}
+
+def save_artist_genre_cache():
+    """Save persistent artist->genres cache to disk."""
+    try:
+        with open(SPOTIFY_ARTIST_GENRE_CACHE_FILE, 'w') as f:
+            json.dump(spotify_artist_genre_cache, f)
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Failed to save artist genre cache: {e}[/yellow]")
 
 def load_spotify_cache():
     """Load previously cached Spotify search results"""
@@ -55,6 +76,25 @@ def save_spotify_cache():
             json.dump(spotify_cache, f)
     except Exception as e:
         console.print(f"[yellow]⚠️  Failed to save Spotify cache: {e}[/yellow]")
+
+def load_lastfm_genre_cache():
+    """Load persistent Last.fm track-genre cache from disk."""
+    global lastfm_track_genre_cache
+    try:
+        if os.path.exists(LASTFM_TRACK_GENRE_CACHE_FILE):
+            with open(LASTFM_TRACK_GENRE_CACHE_FILE, 'r') as f:
+                lastfm_track_genre_cache = json.load(f)
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Failed to load Last.fm genre cache: {e}. Starting fresh.[/yellow]")
+        lastfm_track_genre_cache = {}
+
+def save_lastfm_genre_cache():
+    """Save persistent Last.fm track-genre cache to disk."""
+    try:
+        with open(LASTFM_TRACK_GENRE_CACHE_FILE, 'w') as f:
+            json.dump(lastfm_track_genre_cache, f)
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Failed to save Last.fm genre cache: {e}[/yellow]")
 
 # --- THE DOTENV DETECTIVE (Sherlock Holmes but for API keys) ---
 def load_environment_variables(env_file_path=None):
@@ -92,6 +132,8 @@ def check_api_keys(use_gemini, quiet=False):
     # Gemini is optional for analysis
     if use_gemini:
         optional_keys.append("GEMINI_API_KEY")
+    # Last.fm is optional and used as a genre fallback
+    optional_keys.append("LASTFM_API_KEY")
     
     missing_required = []
     missing_optional = []
@@ -219,7 +261,7 @@ Return ONLY a valid JSON object. No other text, no markdown.
     
     for attempt in range(2):  # Try twice, because APIs are moody
         try:
-            model = genai.GenerativeModel("gemini-2.5-flash-lite")
+            model = genai.GenerativeModel("gemma-3-27b-it")
             response = model.generate_content(prompt)
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(cleaned_response)
@@ -254,15 +296,18 @@ def get_lyrics(genius_api, artist, title):
 
 def get_album_art(sp, artist, title, album=None, verbose=False):
     """
-    Downloads album art from Spotify. Returns the image data as bytes.
-    Now with progress bar for download (but only in verbose mode)!
+    Downloads album art from Spotify by searching with a compact query.
+    Returns image bytes. Used when we don't already have track data.
     """
     try:
-        # If we have album info, search more specifically
-        if album:
-            query = f"artist:{artist} album:{album} track:{title}"
-        else:
-            query = f"artist:{artist} track:{title}"
+        # Build a compact, safe query under the 250-char Spotify limit.
+        # Use primary artist only and drop album to keep it short.
+        primary_artist = (artist.split(",")[0] if "," in artist else artist).strip()
+        title_clean = title.replace('"', '').strip()
+        # Hard cap just in case of extremely long classical titles
+        if len(title_clean) > 120:
+            title_clean = title_clean[:120]
+        query = f"track:\"{title_clean}\" artist:\"{primary_artist}\""
             
         results = sp.search(q=query, type='track', limit=1)
         
@@ -275,7 +320,7 @@ def get_album_art(sp, artist, title, album=None, verbose=False):
         if not album_images:
             return None
             
-        # Get the biggest image (first one is usually the biggest)
+    # Get the biggest image (first one is usually the biggest)
         image_url = album_images[0]['url']
         
         # If verbose, show a download progress bar because we're fancy
@@ -319,6 +364,46 @@ def get_album_art(sp, artist, title, album=None, verbose=False):
         console.print(f"    [red]→ 💀 Album art download failed: {e}[/red]")
         return None
 
+def get_album_art_from_track(track_data, verbose=False):
+    """Downloads album art using images already present in the Spotify track payload."""
+    try:
+        album_images = track_data.get('album', {}).get('images', [])
+        if not album_images:
+            return None
+        image_url = album_images[0]['url']
+
+        if verbose:
+            console.print(f"    [green]→ Downloading album art from track data[/green]")
+            response_head = requests.head(image_url, timeout=5)
+            total_size = int(response_head.headers.get('content-length', 0))
+            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn, TimeElapsedColumn
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True
+            ) as progress:
+                task = progress.add_task("Downloading", total=total_size)
+                response = requests.get(image_url, timeout=10, stream=True)
+                if response.status_code != 200:
+                    return None
+                content = BytesIO()
+                for chunk in response.iter_content(chunk_size=4096):
+                    content.write(chunk)
+                    progress.advance(task, len(chunk))
+                return content.getvalue()
+        else:
+            response = requests.get(image_url, timeout=10)
+            if response.status_code == 200:
+                return response.content
+            return None
+    except Exception as e:
+        console.print(f"    [red]→ 💀 Album art download (from track) failed: {e}[/red]")
+        return None
+
 def search_spotify_with_cache(sp, query, type='track', limit=1):
     """
     Search Spotify but use cache if available.
@@ -341,15 +426,216 @@ def search_spotify_with_cache(sp, query, type='track', limit=1):
         console.print(f"    [red]→ 💀 Spotify search failed: {e}[/red]")
         return None
 
+def _normalize_genre_label(label: str) -> str:
+    """Map granular Spotify genre labels to a clean, top-level genre."""
+    l = label.lower()
+    mapping = [
+        (['hip hop', 'hip-hop', 'rap', 'trap'], 'Hip-Hop'),
+        (['r&b', 'rnb', 'neo-soul'], 'R&B'),
+        (['pop', 'synthpop', 'electropop', 'dance pop'], 'Pop'),
+        (['metal'], 'Metal'),
+        (['punk'], 'Punk'),
+        (['indie'], 'Indie'),
+        (['rock', 'alt rock', 'classic rock', 'hard rock'], 'Rock'),
+        (['edm', 'electronic', 'house', 'techno', 'trance', 'dubstep', 'drum and bass', 'dnb'], 'Electronic'),
+        (['classical', 'orchestra', 'symphony', 'opera', 'choir', 'choral', 'baroque', 'romantic'], 'Classical'),
+        (['jazz', 'bebop', 'swing', 'fusion'], 'Jazz'),
+        (['blues'], 'Blues'),
+        (['country'], 'Country'),
+        (['folk'], 'Folk'),
+        (['latin', 'reggaeton', 'salsa', 'bachata', 'cumbia', 'tango'], 'Latin'),
+        (['afrobeats', 'afrobeat', 'afro'], 'Afrobeats'),
+        (['k-pop', 'kpop'], 'K-Pop'),
+        (['j-pop', 'jpop'], 'J-Pop'),
+        (['soundtrack', 'score'], 'Soundtrack'),
+        (['lo-fi', 'lofi'], 'Lo-Fi'),
+        (['ambient'], 'Ambient'),
+        (['soul'], 'Soul'),
+        (['gospel'], 'Gospel'),
+        (['reggae', 'dancehall'], 'Reggae'),
+        (['world'], 'World'),
+    ]
+    for keys, canonical in mapping:
+        if any(k in l for k in keys):
+            return canonical
+    # Default: title case the original
+    return label.title()
+
+def get_genre_from_lastfm(artist: str, title: str) -> str | None:
+    """Use Last.fm tags to infer a canonical genre for a given track.
+    Tries track.getTopTags then artist.getTopTags. Returns canonical genre or None."""
+    api_key = os.getenv("LASTFM_API_KEY")
+    if not api_key or not artist or not title:
+        return None
+    try:
+        cache_key = f"{artist.lower()}|{title.lower()}"
+        if cache_key in lastfm_track_genre_cache:
+            cached = lastfm_track_genre_cache[cache_key]
+            return cached or None
+
+        base_url = "https://ws.audioscrobbler.com/2.0/"
+        # 1) track.getTopTags
+        params = {
+            'method': 'track.gettoptags',
+            'artist': artist,
+            'track': title,
+            'api_key': api_key,
+            'format': 'json'
+        }
+        r = requests.get(base_url, params=params, timeout=6)
+        tags = []
+        if r.status_code == 200:
+            data = r.json()
+            tag_list = (data.get('toptags') or {}).get('tag') or []
+            for t in tag_list:
+                name = (t.get('name') or '').strip()
+                try:
+                    count = int(t.get('count') or 0)
+                except Exception:
+                    count = 0
+                if name and count > 0:
+                    tags.append((name, count))
+        # 2) fallback artist.getTopTags if needed
+        if not tags:
+            params = {
+                'method': 'artist.gettoptags',
+                'artist': artist,
+                'api_key': api_key,
+                'format': 'json'
+            }
+            r = requests.get(base_url, params=params, timeout=6)
+            if r.status_code == 200:
+                data = r.json()
+                tag_list = (data.get('toptags') or {}).get('tag') or []
+                for t in tag_list:
+                    name = (t.get('name') or '').strip()
+                    try:
+                        count = int(t.get('count') or 0)
+                    except Exception:
+                        count = 0
+                    if name and count > 0:
+                        tags.append((name, count))
+
+        if not tags:
+            lastfm_track_genre_cache[cache_key] = ''
+            return None
+
+        # Normalize tags to canonical genres and pick the most common/highest count
+        canon_counts = {}
+        for name, count in tags:
+            canon = _normalize_genre_label(name)
+            canon_counts[canon] = canon_counts.get(canon, 0) + count
+        top = sorted(canon_counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+        lastfm_track_genre_cache[cache_key] = top
+        return top
+    except Exception:
+        return None
+
+def get_genre_from_spotify(sp, track_data) -> str:
+    """Collect genres from all contributing artists and pick a clean primary genre.
+    If Last.fm API key is available, prefer Last.fm. Otherwise use Spotify with fallbacks."""
+    try:
+        # If Last.fm is available, try it first
+        if os.getenv("LASTFM_API_KEY"):
+            primary_artist = track_data.get('artists', [{}])[0].get('name') if track_data.get('artists') else None
+            lf = get_genre_from_lastfm(primary_artist or '', track_data.get('name') or '')
+            if lf:
+                return lf
+        
+        # Prefer track artists; include album artists as fallback
+        artist_ids = [a['id'] for a in track_data.get('artists', []) if a.get('id')]
+        album_artist_ids = [a['id'] for a in track_data.get('album', {}).get('artists', []) if a.get('id')]
+        # Keep order but avoid duplicates
+        seen = set()
+        ordered_ids = []
+        for aid in artist_ids + album_artist_ids:
+            if aid and aid not in seen:
+                ordered_ids.append(aid)
+                seen.add(aid)
+
+        # Limit to first set, but allow more due to batch endpoint
+        ordered_ids = ordered_ids[:10]
+
+        # Batch fetch artists not in cache
+        to_fetch = [aid for aid in ordered_ids if aid not in spotify_artist_genre_cache]
+        if to_fetch:
+            try:
+                # Spotify batch endpoint supports up to 50
+                batch = sp.artists(to_fetch)
+                for artist_obj in (batch.get('artists') or []):
+                    if not artist_obj:
+                        continue
+                    aid = artist_obj.get('id')
+                    if aid:
+                        spotify_artist_genre_cache[aid] = artist_obj.get('genres', []) or []
+            except Exception:
+                # Fallback to per-artist fetch if batch fails
+                for aid in to_fetch:
+                    try:
+                        info = sp.artist(aid)
+                        spotify_artist_genre_cache[aid] = info.get('genres', []) if info else []
+                    except Exception:
+                        spotify_artist_genre_cache[aid] = []
+
+        all_genres = []
+        for aid in ordered_ids:
+            all_genres.extend(spotify_artist_genre_cache.get(aid, []))
+
+        if not all_genres:
+            # If no Last.fm key was available, try Last.fm as final fallback
+            if not os.getenv("LASTFM_API_KEY"):
+                return 'Unknown'
+            else:
+                primary_artist = track_data.get('artists', [{}])[0].get('name') if track_data.get('artists') else None
+                lf = get_genre_from_lastfm(primary_artist or '', track_data.get('name') or '')
+                return lf or 'Unknown'
+
+        # Normalize and pick the most common canonical label
+        canon_counts = {}
+        for g in all_genres:
+            canon = _normalize_genre_label(g)
+            canon_counts[canon] = canon_counts.get(canon, 0) + 1
+        # Sort by count desc, then by name for stability
+        top = sorted(canon_counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+        return top
+    except Exception:
+        # Any Spotify exception -> try Last.fm if available
+        if os.getenv("LASTFM_API_KEY"):
+            primary_artist = track_data.get('artists', [{}])[0].get('name') if track_data.get('artists') else None
+            lf = get_genre_from_lastfm(primary_artist or '', track_data.get('name') or '')
+            return lf or 'Unknown'
+        return 'Unknown'
+
 def get_directory_from_user():
-    """Shows a GUI dialog. Still ugly, but functional."""
-    root = tk.Tk()
-    root.withdraw()
-    folder_path = filedialog.askdirectory(title="Select Your Music Folder")
-    if not folder_path:
-        console.print("[red]No folder selected. Goodbye![/red]")
-        exit()
-    return Path(folder_path)
+    """Shows a GUI dialog using PyQt6 to select a music folder."""
+    try:
+        import sys
+        from PyQt6.QtWidgets import QApplication, QFileDialog
+
+        app = QApplication.instance()
+        created_app = False
+        if app is None:
+            app = QApplication(sys.argv)
+            created_app = True
+
+        options = QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
+        folder_path = QFileDialog.getExistingDirectory(
+            None,
+            "Select Your Music Folder",
+            str(Path.home()),
+            options,
+        )
+
+        if created_app:
+            app.quit()
+
+        if not folder_path:
+            console.print("[red]No folder selected. Goodbye![/red]")
+            exit()
+        return Path(folder_path)
+    except ImportError:
+        console.print("[red]PyQt6 is not installed. Install it or provide the path with --path.[/red]")
+        exit(1)
 
 # --- THE NUCLEAR OPTION (Now with better messaging) ---
 def strip_metadata_from_files(directory, mode, quiet=False):
@@ -435,8 +721,8 @@ def strip_metadata_from_files(directory, mode, quiet=False):
         console.print("\n[bold green]🎯 Destruction complete. The slate is clean.[/bold green]")
 
 # --- THE SKIP METADATA MODE (For when you just want art) ---
-def add_album_art_only(directory, quiet=False, verbose=False):
-    """Just adds album art to files that already have basic metadata."""
+def add_album_art_only(directory, quiet=False, verbose=False, fetch_lyrics=True):
+    """Adds album art to files that already have basic metadata and (optionally) fetches lyrics."""
     # We still need Spotify for this
     check_api_keys(use_gemini=False, quiet=quiet)
     
@@ -449,6 +735,11 @@ def add_album_art_only(directory, quiet=False, verbose=False):
     ))
     
     mp3_files = list(directory.rglob("*.mp3"))
+
+    # Setup Genius if lyrics are requested
+    genius = None
+    if fetch_lyrics:
+        genius = lyricsgenius.Genius(os.getenv("GENIUS_API_KEY"), verbose=False, remove_section_headers=True, timeout=15)
     
     if not mp3_files:
         console.print("[bold red]Found no MP3 files.[/bold red]")
@@ -461,6 +752,7 @@ def add_album_art_only(directory, quiet=False, verbose=False):
     success_count = 0
     already_had_art = 0
     no_metadata_count = 0
+    lyrics_added = 0
     failed_count = 0
 
     with Progress(
@@ -516,17 +808,27 @@ def add_album_art_only(directory, quiet=False, verbose=False):
                             desc='Cover',
                             data=art_data
                         ))
-                        audio.save()
                         success_count += 1
-                        break  # Success, exit retry loop
                     else:
                         # If we got no art data and this was our last attempt
                         if attempt == 1:
                             failed_count += 1
+                            break
                         else:
                             # Try once more
                             time.sleep(0.5)
                             continue
+                    # Optionally fetch lyrics (if we have artist/title and no existing lyrics)
+                    if fetch_lyrics and genius:
+                        has_lyrics = any(key.startswith('USLT') for key in audio.keys())
+                        if not has_lyrics:
+                            lyr = get_lyrics(genius, artist, title)
+                            if lyr:
+                                audio['USLT::eng'] = USLT(encoding=3, lang='eng', desc='Lyrics', text=lyr)
+                                lyrics_added += 1
+                    # Save changes if any were made
+                    audio.save()
+                    break  # Success, exit retry loop
                 
                 except Exception as e:
                     if attempt == 1:  # This was our last attempt
@@ -553,6 +855,8 @@ def add_album_art_only(directory, quiet=False, verbose=False):
         table.add_row("⏭️ Already had art", str(already_had_art))
         table.add_row("🔍 No metadata to search with", str(no_metadata_count))
         table.add_row("❌ Failed to add art", str(failed_count))
+        if fetch_lyrics:
+            table.add_row("📝 Lyrics added", str(lyrics_added))
         
         console.print(table)
         console.print("\n[bold green]🎨 Album art mission complete![/bold green]")
@@ -726,10 +1030,8 @@ def process_files(directory, use_gemini, fetch_lyrics, force_album_art, no_album
                         "year": track_data['album']['release_date'][:4]
                     }
 
-                    # Get genre from artist
-                    artist_info = sp.artist(track_data['artists'][0]['id'])
-                    genres = artist_info.get('genres', [])
-                    metadata["genre"] = genres[0].title() if genres else 'Unknown'
+                    # Get genre from Spotify (aggregate across artists with normalization)
+                    metadata["genre"] = get_genre_from_spotify(sp, track_data)
 
                     # Optional side quests
                     if use_gemini:
@@ -762,7 +1064,11 @@ def process_files(directory, use_gemini, fetch_lyrics, force_album_art, no_album
                     if should_add_art:
                         if verbose:
                             console.print(f"    [green]🎨 Getting album art for '{metadata['title']}'...[/green]")
-                        art_data = get_album_art(sp, metadata['artist'], metadata['title'], metadata['album'], verbose)
+                        # Prefer existing track_data images to avoid long queries
+                        art_data = get_album_art_from_track(track_data, verbose)
+                        if not art_data:
+                            # Fallback to compact search if album images weren't present
+                            art_data = get_album_art(sp, metadata['artist'], metadata['title'], metadata['album'], verbose)
                         if art_data:
                             # If we're forcing it, delete old art first
                             if force_album_art and has_art:
@@ -977,6 +1283,10 @@ if __name__ == "__main__":
     if args.no_cache:
         spotify_cache = {}  # Empty cache that won't be saved
 
+    # Load persistent artist-genre cache
+    load_artist_genre_cache()
+    load_lastfm_genre_cache()
+
     # Get the directory
     if args.path:
         music_directory = Path(args.path)
@@ -992,7 +1302,7 @@ if __name__ == "__main__":
     elif args.nuke:
         strip_metadata_from_files(music_directory, mode='all', quiet=args.quiet)
     elif args.skip_metadata:
-        add_album_art_only(music_directory, quiet=args.quiet, verbose=args.verbose)
+        add_album_art_only(music_directory, quiet=args.quiet, verbose=args.verbose, fetch_lyrics=args.fetch_lyrics)
     else:
         # Note the new album art arguments being passed here
         process_files(
@@ -1010,3 +1320,7 @@ if __name__ == "__main__":
     # Cleanup crew (Marie Kondo mode)
     if args.cleanup:
         cleanup_temporary_files(music_directory, quiet=args.quiet)
+
+    # Persist artist-genre cache
+    save_artist_genre_cache()
+    save_lastfm_genre_cache()
